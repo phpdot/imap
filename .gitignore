@@ -1,0 +1,9 @@
+/vendor/
+/.phpstan-cache/
+/.phpunit.cache/
+/.php-cs-fixer.cache
+composer.lock
+.claude/
+test.php
+/eml/
+.DS_Store
