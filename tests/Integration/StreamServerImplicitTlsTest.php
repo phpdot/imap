@@ -113,6 +113,13 @@ final class StreamServerImplicitTlsTest extends TestCase
 
         try {
             $client($port);
+        } catch (Throwable $failure) {
+            $serverLog = (string) file_get_contents($stderr);
+            throw new RuntimeException(
+                $failure->getMessage() . "\n--- fixture stderr ---\n" . $serverLog,
+                0,
+                $failure,
+            );
         } finally {
             proc_terminate($proc);
             proc_close($proc);
@@ -141,6 +148,8 @@ final class StreamServerImplicitTlsTest extends TestCase
             $client = @stream_socket_client("ssl://127.0.0.1:{$port}", $errno, $errstr, 5.0, STREAM_CLIENT_CONNECT, $context);
             if ($client !== false) {
                 stream_set_blocking($client, true);
+                stream_set_timeout($client, 10);
+
                 return $client;
             }
             usleep(100_000);
