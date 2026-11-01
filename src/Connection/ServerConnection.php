@@ -806,7 +806,11 @@ final class ServerConnection
 
             if ($name === 'CAPABILITY') {
 
-                $this->dispatch('CAPABILITY', $event);
+                if ($this->handler->getHandler('CAPABILITY') !== null) {
+                    $this->dispatch('CAPABILITY', $event);
+                    return;
+                }
+                $event->accept();
                 return;
             }
 
@@ -840,7 +844,7 @@ final class ServerConnection
     {
         $handler = $this->handler->getHandler($name);
         if ($handler === null) {
-            $event->accept();
+            $event->reject($name . ' not available');
             return;
         }
 
