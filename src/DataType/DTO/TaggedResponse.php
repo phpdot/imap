@@ -1,0 +1,39 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * IMAP tagged response: tag, status, response text.
+ *
+ * @author Omar Hamdan <omar@phpdot.com>
+ * @license MIT
+ */
+
+namespace PHPdot\Mail\IMAP\DataType\DTO;
+
+use PHPdot\Mail\IMAP\DataType\Enum\ResponseStatus;
+use PHPdot\Mail\IMAP\DataType\ValueObject\Tag;
+
+readonly class TaggedResponse
+{
+    public function __construct(
+        public Tag $tag,
+        public ResponseStatus $status,
+        public ResponseText $responseText,
+    ) {}
+
+    public function isOk(): bool
+    {
+        return $this->status === ResponseStatus::Ok;
+    }
+
+    public function isNo(): bool
+    {
+        return $this->status === ResponseStatus::No;
+    }
+
+    public function isBad(): bool
+    {
+        return $this->status === ResponseStatus::Bad;
+    }
+}
