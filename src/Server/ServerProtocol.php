@@ -13,6 +13,7 @@ namespace PHPdot\Mail\IMAP\Server;
 
 use PHPdot\Mail\IMAP\DataType\Enum\ConnectionState;
 use PHPdot\Mail\IMAP\DataType\ValueObject\CapabilitySet;
+use PHPdot\Mail\IMAP\Exception\InvalidArgumentException;
 use PHPdot\Mail\IMAP\Exception\ParseException;
 use PHPdot\Mail\IMAP\Protocol\LineParser;
 use PHPdot\Mail\IMAP\Protocol\Session;
@@ -22,6 +23,7 @@ use PHPdot\Mail\IMAP\Server\Event\Event;
 use PHPdot\Mail\IMAP\Server\Event\IdleEvent;
 use PHPdot\Mail\IMAP\Server\Parser\CommandParser;
 use PHPdot\Mail\IMAP\Server\Response\ResponseBuilder;
+use ValueError;
 
 /**
  * Orchestrates the full server-side IMAP protocol pipeline.
@@ -308,21 +310,18 @@ final class ServerProtocol
 
         try {
             $command = $this->commandParser->parse($line);
-        } catch (ParseException $e) {
-            $this->badCommandCount++;
-            if ($this->badCommandCount >= self::MAX_BAD_COMMANDS) {
-                return [
-                    $this->responseBuilder->bye('Too many invalid commands'),
-                ];
-            }
-            return [
-                $this->responseBuilder->untagged('BAD ' . $e->getMessage()),
-            ];
+        } catch (ParseException | InvalidArgumentException | ValueError $e) {
+            return $this->badCommand('', $e->getMessage());
         }
 
         $this->badCommandCount = 0;
         $this->lastCommandName = $command->name;
-        $responses = $this->dispatcher->dispatch($command);
+
+        try {
+            $responses = $this->dispatcher->dispatch($command);
+        } catch (InvalidArgumentException | ValueError $e) {
+            return $this->badCommand($command->tag, $e->getMessage());
+        }
 
         if ($command->name === 'IDLE') {
             $this->checkIdleStarted();
@@ -333,6 +332,26 @@ final class ServerProtocol
         }
 
         return $responses;
+    }
+
+    /**
+     * A malformed or unwelcome command is answered, never thrown: the worker
+     * must survive anything a client sends before authentication.
+     *
+     * @return list<string>
+     */
+    private function badCommand(string $tag, string $message): array
+    {
+        $this->badCommandCount++;
+        if ($this->badCommandCount >= self::MAX_BAD_COMMANDS) {
+            return [
+                $this->responseBuilder->bye('Too many invalid commands'),
+            ];
+        }
+
+        return $tag === ''
+            ? [$this->responseBuilder->untagged('BAD ' . $message)]
+            : [$this->responseBuilder->bad($tag, $message)];
     }
 
     /**
