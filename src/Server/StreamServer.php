@@ -164,8 +164,7 @@ final class StreamServer implements ServerInterface
         }
 
         $context = stream_context_create($contextOptions);
-        $scheme = $this->implicitTls ? 'ssl' : 'tcp';
-        $address = $scheme . '://' . $this->host . ':' . $this->port;
+        $address = 'tcp://' . $this->host . ':' . $this->port;
 
         $socket = @stream_socket_server(
             $address,
