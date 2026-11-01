@@ -13,6 +13,7 @@ namespace PHPdot\Mail\IMAP\Server;
 
 use PHPdot\Mail\IMAP\DataType\Enum\ConnectionState;
 use PHPdot\Mail\IMAP\DataType\ValueObject\CapabilitySet;
+use PHPdot\Mail\IMAP\DataType\ValueObject\Tag;
 use PHPdot\Mail\IMAP\Exception\InvalidArgumentException;
 use PHPdot\Mail\IMAP\Exception\ParseException;
 use PHPdot\Mail\IMAP\Protocol\LineParser;
@@ -311,7 +312,7 @@ final class ServerProtocol
         try {
             $command = $this->commandParser->parse($line);
         } catch (ParseException | InvalidArgumentException | ValueError $e) {
-            return $this->badCommand('', $e->getMessage());
+            return $this->badCommand(null, $e->getMessage());
         }
 
         $this->badCommandCount = 0;
@@ -340,7 +341,7 @@ final class ServerProtocol
      *
      * @return list<string>
      */
-    private function badCommand(string $tag, string $message): array
+    private function badCommand(Tag|null $tag, string $message): array
     {
         $this->badCommandCount++;
         if ($this->badCommandCount >= self::MAX_BAD_COMMANDS) {
@@ -349,7 +350,7 @@ final class ServerProtocol
             ];
         }
 
-        return $tag === ''
+        return $tag === null
             ? [$this->responseBuilder->untagged('BAD ' . $message)]
             : [$this->responseBuilder->bad($tag, $message)];
     }
