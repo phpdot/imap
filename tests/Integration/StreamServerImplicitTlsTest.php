@@ -117,8 +117,6 @@ final class StreamServerImplicitTlsTest extends TestCase
             $serverLog = (string) file_get_contents($stderr);
             throw new RuntimeException(
                 $failure->getMessage() . "\n--- fixture stderr ---\n" . $serverLog,
-                0,
-                $failure,
             );
         } finally {
             proc_terminate($proc);
