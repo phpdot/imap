@@ -45,6 +45,9 @@ final class LineParser
     /** Dropping an over-long line that has not reached its line break yet. */
     private bool $skipToEol = false;
 
+    /** Cumulative literal octets of the command being assembled; stacked literals must not multiply past the cap. */
+    private int $commandLiteralBytes = 0;
+
     /** Octets of the current command outside literals — what the line limit applies to. */
     private int $lineLength = 0;
 
@@ -140,7 +143,7 @@ final class LineParser
                 $litSize = (int) $matches[1];
                 $this->literalPlus = isset($matches[2]);
 
-                if ($this->maxLiteralSize > 0 && $litSize > $this->maxLiteralSize) {
+                if ($this->maxLiteralSize > 0 && ($litSize > $this->maxLiteralSize || $this->commandLiteralBytes + $litSize > $this->maxLiteralSize)) {
                     $this->startDiscarding('Literal exceeds the maximum size');
                 }
 
@@ -152,6 +155,7 @@ final class LineParser
 
                 if (!$this->discarding) {
                     $this->accumulated .= $line . "\r\n";
+                    $this->commandLiteralBytes += $litSize;
                 }
                 $this->literalRemaining = $litSize;
                 $this->inLiteral = true;
@@ -168,6 +172,7 @@ final class LineParser
             $this->accumulated = '';
             $this->lineLength = 0;
             $this->currentTag = '';
+            $this->commandLiteralBytes = 0;
         }
 
         return $lines;
@@ -213,6 +218,7 @@ final class LineParser
         $this->accumulated = '';
         $this->lineLength = 0;
         $this->currentTag = '';
+        $this->commandLiteralBytes = 0;
     }
 
     private static function tagOf(string $line): string
