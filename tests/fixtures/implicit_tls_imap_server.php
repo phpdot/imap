@@ -3,7 +3,7 @@
 /**
  * Child-process fixture: boots a StreamServer with implicit TLS (IMAPS).
  *
- * Usage: php implicit_tls_imap_server.php <port> <cert.pem> <key.pem>
+ * Usage: php implicit_tls_imap_server.php <port> <cert.pem> <key.pem> [starttls]
  *
  * Accepts exactly one credential pair (user/pass).
  *
@@ -58,5 +58,9 @@ $server = new StreamServer(
     '127.0.0.1',
     (int) $port,
 );
-$server->enableImplicitTls($certFile, $keyFile);
+if (($argv[4] ?? '') === 'starttls') {
+    $server->enableTls($certFile, $keyFile);
+} else {
+    $server->enableImplicitTls($certFile, $keyFile);
+}
 $server->start();

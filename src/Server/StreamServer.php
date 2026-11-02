@@ -78,6 +78,12 @@ final class StreamServer implements ServerInterface
     /** @var array<int, string> Outbound write buffers keyed by id — flushed when the socket is writable. */
     private array $writeBuffers = [];
 
+    /** @var array<int, true> Connections that accepted STARTTLS, read no further until their OK is flushed. */
+    private array $upgrading = [];
+
+    /** @var array<int, string> The address each connection came from, for the per-address cap. */
+    private array $addresses = [];
+
     public function __construct(
         private readonly ImapHandler $handler,
         private readonly string $host = '0.0.0.0',
@@ -92,6 +98,8 @@ final class StreamServer implements ServerInterface
         private readonly int $maxConnections = 512,
         private readonly int $idleTimeout = 2100,
         private readonly int $maxLiteralBytes = 52428800,
+        private readonly int $preAuthTimeout = 60,
+        private readonly int $maxConnectionsPerAddress = 32,
     ) {
         $this->notifier = new InMemoryNotifier();
     }
@@ -125,7 +133,8 @@ final class StreamServer implements ServerInterface
     }
 
     /**
-     * Enable STARTTLS support. Provide paths to PEM-encoded cert and key.
+     * Enable STARTTLS with a PEM certificate and key: sessions start in plaintext with LOGIN disabled until the
+     * client upgrades, and nothing it sent after STARTTLS but before the handshake is ever read as a command.
      */
     public function enableTls(string $certFile, string $keyFile): void
     {
@@ -208,7 +217,7 @@ final class StreamServer implements ServerInterface
                 pcntl_signal_dispatch();
             }
 
-            $read = array_diff_key($this->clients, $this->outQueues);
+            $read = array_diff_key($this->clients, $this->outQueues, $this->upgrading);
             $read[] = $socket;
 
             $write = $this->writeBuffers === []
@@ -262,11 +271,19 @@ final class StreamServer implements ServerInterface
             return;
         }
 
+        $address = $this->extractIp($client);
+        if ($this->maxConnectionsPerAddress > 0
+            && count(array_keys($this->addresses, $address, true)) >= $this->maxConnectionsPerAddress) {
+            @fclose($client);
+            return;
+        }
+
         stream_set_blocking($client, false);
         stream_set_timeout($client, 300);
 
         $id = (int) $client;
         $this->clients[$id] = $client;
+        $this->addresses[$id] = $address;
         $this->lastActivity[$id] = microtime(true);
 
         if ($this->implicitTls) {
@@ -288,6 +305,9 @@ final class StreamServer implements ServerInterface
         $remoteAddr = $this->extractIp($client);
 
         $conn = new ServerConnection($this->handler, $this->notifier, $remoteAddr, $this->maxLiteralBytes);
+        if (!$this->implicitTls && $this->tlsCertFile !== '') {
+            $conn->context()->session()->setTlsActive(false);
+        }
         $conn->setPushWriter(function (string $bytes) use ($client): void {
 
             $this->writeToClient($client, $bytes, true);
@@ -314,7 +334,12 @@ final class StreamServer implements ServerInterface
 
         if ($result === true) {
             unset($this->handshaking[$id]);
-            $this->initializeConnection($stream);
+            $conn = $this->connections[$id] ?? null;
+            if ($conn !== null) {
+                $conn->tlsUpgraded();
+            } else {
+                $this->initializeConnection($stream);
+            }
             return;
         }
 
@@ -378,7 +403,27 @@ final class StreamServer implements ServerInterface
 
         if ($conn->isLoggedOut()) {
             $this->closeAfterFlush($id);
+            return;
         }
+
+        if ($conn->needsTlsUpgrade()) {
+            $this->upgrading[$id] = true;
+            $this->upgradeWhenFlushed($id);
+        }
+    }
+
+    /**
+     * Start the STARTTLS handshake once the tagged OK has left the buffer: the next bytes the client sends are TLS.
+     */
+    private function upgradeWhenFlushed(int $id): void
+    {
+        if (!isset($this->upgrading[$id], $this->clients[$id]) || isset($this->writeBuffers[$id]) || isset($this->outQueues[$id])) {
+            return;
+        }
+
+        unset($this->upgrading[$id]);
+        $this->handshaking[$id] = $this->clients[$id];
+        $this->driveTlsHandshake($this->clients[$id], $id);
     }
 
     /**
@@ -561,7 +606,10 @@ final class StreamServer implements ServerInterface
         $this->pump($id);
         if (isset($this->closing[$id]) && !isset($this->writeBuffers[$id]) && !isset($this->outQueues[$id])) {
             $this->removeClient($id);
+            return;
         }
+
+        $this->upgradeWhenFlushed($id);
     }
 
     private function reapIdleConnections(): void
@@ -571,9 +619,12 @@ final class StreamServer implements ServerInterface
 
         foreach ($this->lastActivity as $id => $lastTime) {
 
-            $limit = isset($this->connections[$id]) && $this->connections[$id]->isIdling()
-                ? (float) $this->idleTimeout
-                : $timeout;
+            $conn = $this->connections[$id] ?? null;
+            $limit = match (true) {
+                $conn === null, !$conn->isAuthenticated() => (float) $this->preAuthTimeout,
+                $conn->isIdling() => (float) $this->idleTimeout,
+                default => $timeout,
+            };
 
             if (($now - $lastTime) > $limit) {
                 if (isset($this->connections[$id])) {
@@ -595,7 +646,7 @@ final class StreamServer implements ServerInterface
             @fclose($this->clients[$id]);
             unset($this->clients[$id]);
         }
-        unset($this->connections[$id], $this->lastActivity[$id], $this->handshaking[$id], $this->writeBuffers[$id], $this->commandBuckets[$id], $this->closing[$id], $this->outQueues[$id]);
+        unset($this->connections[$id], $this->lastActivity[$id], $this->handshaking[$id], $this->writeBuffers[$id], $this->commandBuckets[$id], $this->closing[$id], $this->outQueues[$id], $this->upgrading[$id], $this->addresses[$id]);
     }
 
     private function cleanup(): void
@@ -614,6 +665,8 @@ final class StreamServer implements ServerInterface
         $this->handshaking = [];
         $this->writeBuffers = [];
         $this->outQueues = [];
+        $this->upgrading = [];
+        $this->addresses = [];
 
         if ($this->socket !== null) {
             @fclose($this->socket);

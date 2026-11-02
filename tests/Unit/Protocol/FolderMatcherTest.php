@@ -85,4 +85,23 @@ final class FolderMatcherTest extends TestCase
         self::assertFalse(FolderMatcher::matches('INBOX.Sub.folder', 'INBOX.%', '.'));
         self::assertTrue(FolderMatcher::matches('INBOX.Sub.folder', 'INBOX.*', '.'));
     }
+
+    #[Test]
+    public function inboxMatchesInAnyCase(): void
+    {
+        self::assertTrue(FolderMatcher::matches('INBOX', 'inbox'));
+        self::assertTrue(FolderMatcher::matches('INBOX/Work', 'Inbox/%'));
+        self::assertTrue(FolderMatcher::matches('inbox', 'INBOX'));
+        self::assertFalse(FolderMatcher::matches('Inboxes', 'INBOX'));
+    }
+
+    #[Test]
+    public function aLongWildcardPatternIsAnsweredQuickly(): void
+    {
+        $started = microtime(true);
+        $matched = FolderMatcher::matches(str_repeat('a', 500) . 'b', str_repeat('*a', 200) . 'c');
+
+        self::assertFalse($matched);
+        self::assertLessThan(1.0, microtime(true) - $started);
+    }
 }

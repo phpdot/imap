@@ -47,6 +47,11 @@ final class ServerProtocol
     private int $badCommandCount = 0;
     private const int MAX_BAD_COMMANDS = 50;
 
+    /** Literal bytes one command may carry before the client has authenticated. */
+    private const int PRE_AUTH_LITERAL_BYTES = 8192;
+
+    private bool $tlsPending = false;
+
     private IdleEvent|null $activeIdle = null;
 
     /** @var (\Closure(list<string>, null|string): list<string|\Iterator<mixed, string>>)|null */
@@ -63,7 +68,7 @@ final class ServerProtocol
     public function __construct(
         StateMachine|null $stateMachine = null,
         Session|null $session = null,
-        int $maxLiteralBytes = 52428800,
+        private readonly int $maxLiteralBytes = 52428800,
     ) {
         $this->lineParser = new LineParser($maxLiteralBytes);
         $this->commandParser = new CommandParser();
@@ -141,6 +146,14 @@ final class ServerProtocol
      */
     public function onDataDeferred(string $bytes): array
     {
+        if ($this->tlsPending || $this->isLoggedOut()) {
+            return [];
+        }
+
+        $this->lineParser->setMaxLiteralSize($this->stateMachine->state() === ConnectionState::NotAuthenticated
+            ? min(self::PRE_AUTH_LITERAL_BYTES, $this->maxLiteralBytes > 0 ? $this->maxLiteralBytes : PHP_INT_MAX)
+            : $this->maxLiteralBytes);
+
         $lines = $this->lineParser->feed($bytes);
         $this->linesProcessed += count($lines);
         foreach ($lines as $line) {
@@ -207,7 +220,15 @@ final class ServerProtocol
                 $lazy = $lazy || !is_string($response);
             }
 
-            if ($lazy) {
+            if ($this->lastCommandName === 'STARTTLS' && $this->dispatcher->lastEvent()?->isAccepted() === true) {
+                $this->tlsPending = true;
+                $this->backlog = [];
+                $this->lineParser->reset();
+                break;
+            }
+
+            if ($lazy || $this->isLoggedOut()) {
+                $this->backlog = $this->isLoggedOut() ? [] : $this->backlog;
                 break;
             }
         }
@@ -280,6 +301,25 @@ final class ServerProtocol
     }
 
     /**
+     * Whether STARTTLS was accepted and the transport must now run the TLS handshake; until tlsUpgraded() is
+     * called, every byte received is discarded, so nothing sent in plaintext after STARTTLS is ever executed.
+     */
+    public function needsTlsUpgrade(): bool
+    {
+        return $this->tlsPending;
+    }
+
+    /**
+     * Records that the transport finished the TLS handshake STARTTLS asked for.
+     */
+    public function tlsUpgraded(): void
+    {
+        $this->tlsPending = false;
+        $this->lineParser->reset();
+        $this->session->setTlsActive();
+    }
+
+    /**
      * Whether the connection is in IDLE mode.
      */
     public function isIdling(): bool
@@ -309,10 +349,14 @@ final class ServerProtocol
             return $this->processAuthResponse($line);
         }
 
+        $this->commandParser->setUtf7Mailboxes($this->session->useUtf7Mailbox());
+
         try {
             $command = $this->commandParser->parse($line);
-        } catch (ParseException | InvalidArgumentException | ValueError $e) {
+        } catch (ParseException | InvalidArgumentException $e) {
             return $this->badCommand(null, $e->getMessage());
+        } catch (ValueError) {
+            return $this->badCommand(null, 'Invalid command arguments');
         }
 
         $this->badCommandCount = 0;
@@ -320,8 +364,10 @@ final class ServerProtocol
 
         try {
             $responses = $this->dispatcher->dispatch($command);
-        } catch (InvalidArgumentException | ValueError $e) {
+        } catch (InvalidArgumentException $e) {
             return $this->badCommand($command->tag, $e->getMessage());
+        } catch (ValueError) {
+            return $this->badCommand($command->tag, 'Invalid command arguments');
         }
 
         if ($command->name === 'IDLE') {
@@ -345,13 +391,15 @@ final class ServerProtocol
     {
         $this->badCommandCount++;
         if ($this->badCommandCount >= self::MAX_BAD_COMMANDS) {
+            $this->stateMachine->logout();
+
             return [
                 $this->responseBuilder->bye('Too many invalid commands'),
             ];
         }
 
         return $tag === null
-            ? [$this->responseBuilder->untagged('BAD ' . $message)]
+            ? [$this->responseBuilder->untagged('BAD ' . ResponseBuilder::text($message))]
             : [$this->responseBuilder->bad($tag, $message)];
     }
 

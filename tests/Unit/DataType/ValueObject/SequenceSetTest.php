@@ -148,4 +148,16 @@ final class SequenceSetTest extends TestCase
         $set = SequenceSet::fromString('5:2');
         self::assertSame([2, 3, 4, 5], $set->expand(100));
     }
+
+    #[Test]
+    public function expandMergesOverlappingRangesWithoutMaterializingEachOne(): void
+    {
+        $set = SequenceSet::fromString(implode(',', array_fill(0, 16000, '1:*')) . ',3,2:4');
+
+        $before = memory_get_usage();
+        $numbers = $set->expand(1000);
+
+        self::assertSame(range(1, 1000), $numbers);
+        self::assertLessThan(8 * 1024 * 1024, memory_get_usage() - $before);
+    }
 }

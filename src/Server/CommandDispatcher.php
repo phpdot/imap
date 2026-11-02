@@ -11,6 +11,7 @@ declare(strict_types=1);
 
 namespace PHPdot\Mail\IMAP\Server;
 
+use PHPdot\Mail\IMAP\DataType\Enum\ConnectionState;
 use PHPdot\Mail\IMAP\DataType\Enum\ResponseCode;
 use PHPdot\Mail\IMAP\DataType\ValueObject\CapabilitySet;
 use PHPdot\Mail\IMAP\DataType\ValueObject\SequenceSet;
@@ -84,6 +85,7 @@ final class CommandDispatcher
      */
     public function dispatch(Command $command): array
     {
+        $this->lastEvent = null;
 
         try {
             $this->stateMachine->assertCommandAllowed($command->name);
@@ -144,6 +146,10 @@ final class CommandDispatcher
         if ($event->isAccepted()) {
             $this->stateMachine->applySuccessTransition($command->name);
             return $this->buildAcceptResponse($command, $event);
+        }
+
+        if ($command instanceof SelectCommand && $this->stateMachine->state() === ConnectionState::Selected) {
+            $this->stateMachine->deselected();
         }
 
         return [$this->responseBuilder->tagged(
@@ -366,7 +372,7 @@ final class CommandDispatcher
             $responses[] = $this->responseBuilder->ok(
                 $command->tag,
                 $command->name . ' completed',
-                $event->getResult()->readWrite ? ResponseCode::ReadWrite : ResponseCode::ReadOnly,
+                $event->getResult()->readWrite && !$command->readOnly ? ResponseCode::ReadWrite : ResponseCode::ReadOnly,
             );
 
             return $responses;

@@ -6,6 +6,8 @@ namespace PHPdot\Mail\IMAP\Tests\Unit;
 
 use PHPdot\Mail\IMAP\Exception\AuthenticationException;
 use PHPdot\Mail\IMAP\Exception\ConnectionException;
+use PHPdot\Mail\IMAP\Exception\InvalidArgumentException;
+use PHPdot\Mail\IMAP\Exception\RuntimeException;
 use PHPdot\Mail\IMAP\ImapClient;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
@@ -308,5 +310,34 @@ final class ImapClientTest extends TestCase
 
         $this->serverWrite("* BYE\r\nA007 OK LOGOUT completed\r\n");
         $this->client->logout();
+    }
+
+    #[Test]
+    public function anArgumentCarryingALineBreakIsNeverSent(): void
+    {
+        $this->serverWrite("* OK ready\r\n");
+        $this->client->connect();
+
+        try {
+            $this->client->fetch("1 BODY[]\r\nA999 DELETE INBOX", ['FLAGS']);
+            self::fail('the injected command was sent');
+        } catch (InvalidArgumentException) {
+            self::assertSame('', $this->serverRead());
+        }
+    }
+
+    #[Test]
+    public function aSynchronizingLiteralWaitsForTheServersContinuation(): void
+    {
+        $this->serverWrite("* OK ready\r\n");
+        $this->client->connect();
+        $this->serverWrite("A001 NO Literal too large\r\n");
+
+        try {
+            $this->client->login('user', "pa\r\nss");
+            self::fail('the refused login went on');
+        } catch (RuntimeException) {
+            self::assertSame("A001 LOGIN user {6}\r\n", $this->serverRead());
+        }
     }
 }

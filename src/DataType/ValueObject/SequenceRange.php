@@ -33,22 +33,29 @@ readonly class SequenceRange implements \Stringable
      */
     public function expand(int $max): array
     {
+        $bounds = $this->bounds($max);
+
+        return $bounds === null ? [] : range($bounds[0], $bounds[1]);
+    }
+
+    /**
+     * The lowest and highest number this range covers with `*` resolved to $max, or null when it covers none.
+     *
+     * @return array{int, int}|null
+     */
+    public function bounds(int $max): array|null
+    {
         $from = $this->start === '*' ? $max : (int) $this->start;
         $to = $this->end === null ? $from : ($this->end === '*' ? $max : (int) $this->end);
 
         if ($from === 0 || $to === 0) {
-            return [];
+            return null;
         }
 
-        $low = min($from, $to);
+        $low = max(1, min($from, $to));
         $high = min(max($from, $to), $max);
-        $low = max(1, $low);
 
-        $result = [];
-        for ($i = $low; $i <= $high; $i++) {
-            $result[] = $i;
-        }
-        return $result;
+        return $low > $high ? null : [$low, $high];
     }
 
     /**

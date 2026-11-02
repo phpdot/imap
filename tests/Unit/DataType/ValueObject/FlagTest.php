@@ -85,4 +85,20 @@ final class FlagTest extends TestCase
         self::assertSame('\\Seen', (string) new Flag('\\Seen'));
         self::assertSame('$Forwarded', (string) new Flag('$Forwarded'));
     }
+
+    #[Test]
+    public function aFlagOutsideTheGrammarIsRefused(): void
+    {
+        foreach (["x)\r\n* 99 EXPUNGE", 'a b', 'x"y', 'n%', "caf\xc3\xa9", '\\'] as $value) {
+            try {
+                new Flag($value);
+                self::fail(json_encode($value) . ' was accepted');
+            } catch (InvalidArgumentException) {
+                self::assertFalse(Flag::isValid($value));
+            }
+        }
+
+        self::assertSame('$Forwarded', (new Flag('$Forwarded'))->value);
+        self::assertSame('\\*', (new Flag('\\*'))->value);
+    }
 }

@@ -22,6 +22,7 @@ use PHPdot\Mail\IMAP\DataType\ValueObject\NamespaceSet;
 use PHPdot\Mail\IMAP\DataType\ValueObject\SequenceSet;
 use PHPdot\Mail\IMAP\DataType\ValueObject\Tag;
 use PHPdot\Mail\IMAP\Protocol\Compiler;
+use PHPdot\Mail\IMAP\Protocol\Encoding\ModifiedUtf7;
 use PHPdot\Mail\IMAP\Protocol\WireFormat;
 
 /**
@@ -30,6 +31,7 @@ use PHPdot\Mail\IMAP\Protocol\WireFormat;
 final class ResponseBuilder
 {
     private readonly Compiler $compiler;
+    private bool $utf7Mailboxes = false;
 
     public function __construct()
     {
@@ -43,9 +45,17 @@ final class ResponseBuilder
             $response .= ' [' . $code->value . ']';
         }
         if ($text !== '') {
-            $response .= ' ' . $text;
+            $response .= ' ' . self::text($text);
         }
         return $response . "\r\n";
+    }
+
+    /**
+     * Human-readable response text on one line: control characters, CR and LF among them, become spaces.
+     */
+    public static function text(string $text): string
+    {
+        return preg_replace('/[\x00-\x1f\x7f]+/', ' ', $text) ?? '';
     }
 
     public function ok(Tag $tag, string $text = '', ResponseCode|null $code = null): string
@@ -98,7 +108,7 @@ final class ResponseBuilder
 
     public function bye(string $text = 'Server closing connection'): string
     {
-        return '* BYE ' . $text . "\r\n";
+        return '* BYE ' . self::text($text) . "\r\n";
     }
 
     public function exists(int $count): string
@@ -130,6 +140,19 @@ final class ResponseBuilder
         return '* CAPABILITY ' . $capabilities->toWireString() . "\r\n";
     }
 
+    /**
+     * Sets whether mailbox names are sent in modified UTF-7, as an IMAP4rev1 client without UTF8=ACCEPT expects.
+     */
+    public function setUtf7Mailboxes(bool $utf7): void
+    {
+        $this->utf7Mailboxes = $utf7;
+    }
+
+    private function mailboxName(string $name): string
+    {
+        return $this->compiler->compileString($this->utf7Mailboxes ? ModifiedUtf7::encode($name) : $name);
+    }
+
     public function lsub(MailboxInfo $info): string
     {
         return '* LSUB' . substr($this->list($info), strlen('* LIST'));
@@ -146,7 +169,7 @@ final class ResponseBuilder
             ? $this->compiler->compileQuoted($info->delimiter)
             : 'NIL';
 
-        $name = $this->compiler->compileString($info->mailbox->name);
+        $name = $this->mailboxName($info->mailbox->name);
 
         return '* LIST (' . implode(' ', $attrs) . ') ' . $delimiter . ' ' . $name . "\r\n";
     }
@@ -180,7 +203,7 @@ final class ResponseBuilder
             $items[] = 'RECENT ' . $statusInfo->recent;
         }
 
-        $name = $this->compiler->compileString($statusInfo->mailbox->name);
+        $name = $this->mailboxName($statusInfo->mailbox->name);
         return '* STATUS ' . $name . ' (' . implode(' ', $items) . ")\r\n";
     }
 

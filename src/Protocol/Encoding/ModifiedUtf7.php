@@ -63,7 +63,7 @@ final class ModifiedUtf7
     }
 
     /**
-     * Decode a modified UTF-7 IMAP mailbox name to UTF-8.
+     * Decode a modified UTF-7 IMAP mailbox name to UTF-8, refusing any spelling encode() would not produce.
      */
     public static function decode(string $encoded): string
     {
@@ -94,6 +94,10 @@ final class ModifiedUtf7
                 $result .= $encoded[$pos];
                 $pos++;
             }
+        }
+
+        if (preg_match('/[\x00-\x1f\x7f]/', $result) === 1 || self::encode($result) !== $encoded) {
+            throw new EncodingException('Mailbox name is not canonical modified UTF-7');
         }
 
         return $result;
@@ -154,6 +158,10 @@ final class ModifiedUtf7
                 }
                 $code = 0x10000 + (($code - 0xD800) << 10) + ($low - 0xDC00);
                 $i += 2;
+            }
+
+            if ($code >= 0xD800 && $code <= 0xDFFF) {
+                throw new EncodingException('Unpaired surrogate in modified UTF-7');
             }
 
             $result .= mb_chr($code, 'UTF-8');

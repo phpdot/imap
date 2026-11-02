@@ -18,6 +18,7 @@ use PHPdot\Mail\IMAP\DataType\ValueObject\CapabilitySet;
 use PHPdot\Mail\IMAP\DataType\ValueObject\Flag;
 use PHPdot\Mail\IMAP\DataType\ValueObject\NamespaceSet;
 use PHPdot\Mail\IMAP\ImapHandler;
+use PHPdot\Mail\IMAP\Protocol\Compiler;
 use PHPdot\Mail\IMAP\Protocol\WireFormat;
 use PHPdot\Mail\IMAP\Result\SelectResult;
 use PHPdot\Mail\IMAP\Server\Event\AclEvent;
@@ -47,7 +48,11 @@ use PHPdot\Mail\IMAP\Server\ServerProtocol;
 
 final class ServerConnection
 {
+    /** What a client is told when the host's handler throws: the exception's own text never leaves the server. */
+    private const string SERVER_ERROR = 'Server error';
+
     private readonly ServerProtocol $protocol;
+    private readonly Compiler $compiler;
     private readonly ConnectionContext $context;
     private readonly ResponseBuilder $rb;
 
@@ -60,6 +65,13 @@ final class ServerConnection
     /** Transport write callback — where notifier pushes land on the socket. */
     private \Closure|null $pushWriter = null;
 
+    /** Whether a command is running, so bytes arriving meanwhile wait their turn instead of interleaving. */
+    private bool $busy = false;
+
+    private string $waiting = '';
+
+    private bool $readOnly = false;
+
     public function __construct(
         private readonly ImapHandler $handler,
         private readonly NotifierInterface|null $notifier = null,
@@ -70,6 +82,7 @@ final class ServerConnection
 
         $this->protocol = new ServerProtocol(null, $this->context->session(), $maxLiteralBytes);
         $this->rb = new ResponseBuilder();
+        $this->compiler = new Compiler();
         $this->registerHandlers();
 
         $this->protocol->setResponseInterceptor(function (array $responses, string|null $commandName): array {
@@ -103,9 +116,28 @@ final class ServerConnection
      */
     public function onData(string $bytes): array
     {
-        $this->pendingData = [];
+        if ($this->busy) {
+            $this->waiting .= $bytes;
 
-        return $this->protocol->onData($bytes);
+            return [];
+        }
+
+        $bytes = $this->takeWaiting() . $bytes;
+        $this->busy = true;
+        try {
+            $out = [];
+            do {
+                $this->pendingData = [];
+                foreach ($this->protocol->onData($bytes) as $line) {
+                    $out[] = $line;
+                }
+                $bytes = $this->takeWaiting();
+            } while ($bytes !== '');
+
+            return $out;
+        } finally {
+            $this->busy = false;
+        }
     }
 
     /**
@@ -121,17 +153,71 @@ final class ServerConnection
      */
     public function onDataDeferred(string $bytes): array
     {
-        $this->pendingData = [];
+        if ($this->busy) {
+            $this->waiting .= $bytes;
 
-        return $this->protocol->onDataDeferred($bytes);
+            return [];
+        }
+
+        $bytes = $this->takeWaiting() . $bytes;
+        $this->busy = true;
+        try {
+            $this->pendingData = [];
+
+            return $this->drainWaiting($this->protocol->onDataDeferred($bytes));
+        } finally {
+            $this->busy = false;
+        }
     }
 
     /**
-     * Whether pipelined commands are held back behind a lazy response.
+     * Runs the bytes that arrived while a command was running, unless a lazy response must be consumed first.
+     *
+     * @param list<string|\Iterator<mixed, string>> $responses
+     *
+     * @return list<string|\Iterator<mixed, string>>
+     */
+    private function drainWaiting(array $responses): array
+    {
+        while ($this->waiting !== '' && !$this->protocol->hasBacklog() && !$this->hasLazy($responses)) {
+            $bytes = $this->takeWaiting();
+            $this->pendingData = [];
+            foreach ($this->protocol->onDataDeferred($bytes) as $response) {
+                $responses[] = $response;
+            }
+        }
+
+        return $responses;
+    }
+
+    private function takeWaiting(): string
+    {
+        $bytes = $this->waiting;
+        $this->waiting = '';
+
+        return $bytes;
+    }
+
+    /**
+     * @param list<string|\Iterator<mixed, string>> $responses
+     */
+    private function hasLazy(array $responses): bool
+    {
+        foreach ($responses as $response) {
+            if (!is_string($response)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Whether pipelined commands, or bytes that arrived while one ran, wait behind a lazy response.
      */
     public function hasBacklog(): bool
     {
-        return $this->protocol->hasBacklog();
+        return $this->protocol->hasBacklog() || $this->waiting !== '';
     }
 
     /**
@@ -142,9 +228,35 @@ final class ServerConnection
      */
     public function resume(): array
     {
-        $this->pendingData = [];
+        if ($this->busy) {
+            return [];
+        }
 
-        return $this->protocol->resume();
+        $this->busy = true;
+        try {
+            $this->pendingData = [];
+
+            return $this->drainWaiting($this->protocol->resume());
+        } finally {
+            $this->busy = false;
+        }
+    }
+
+    /**
+     * Whether STARTTLS was accepted and the transport must now upgrade the socket before reading anything more.
+     */
+    public function needsTlsUpgrade(): bool
+    {
+        return $this->protocol->needsTlsUpgrade();
+    }
+
+    /**
+     * Records that the transport finished the TLS handshake; bytes it read in plaintext meanwhile are discarded.
+     */
+    public function tlsUpgraded(): void
+    {
+        $this->waiting = '';
+        $this->protocol->tlsUpgraded();
     }
 
     /**
@@ -275,6 +387,9 @@ final class ServerConnection
 
         $hasModseq = $numbers !== [] && count($modseqs) === count($numbers);
         $options = $event->returnOptions();
+        if ($options === [] && $this->context->session()->useEsearch()) {
+            $options = ['ALL'];
+        }
 
         if ($options === []) {
             return $hasModseq
@@ -344,8 +459,23 @@ final class ServerConnection
             );
         }
         $this->queuedChanges = [];
+        $this->readOnly = false;
         $this->context->trackUids(null);
         $this->context->setSelectedMailbox(null);
+    }
+
+    /**
+     * Refuses a change to a mailbox opened with EXAMINE, as RFC 9051 §6.3.3 requires.
+     */
+    private function refusedReadOnly(Event $event): bool
+    {
+        if (!$this->readOnly) {
+            return false;
+        }
+
+        $event->reject('Mailbox is read-only');
+
+        return true;
     }
 
     /**
@@ -416,7 +546,10 @@ final class ServerConnection
     /** @param list<string> $flags */
     public function pushFlagUpdate(int $sequenceNumber, int $uid, array $flags): string
     {
-        $flagObjs = array_map(static fn(string $f): Flag => new Flag($f), $flags);
+        $flagObjs = array_map(
+            static fn(string $f): Flag => new Flag($f),
+            array_values(array_filter($flags, Flag::isValid(...))),
+        );
         return $this->protocol->pushFlagUpdate($sequenceNumber, $uid, $flagObjs);
     }
 
@@ -507,6 +640,7 @@ final class ServerConnection
 
                 $result = $event->getResult();
                 if ($result instanceof SelectResult) {
+                    $this->readOnly = $event->isReadOnly() || !$result->readWrite;
                     $this->context->setSelectedMailbox($event->mailbox()->name);
                     $this->context->trackUids($result->uids);
 
@@ -536,9 +670,9 @@ final class ServerConnection
 
                     $this->subscribeToSelected($event->mailbox()->name);
                 }
-            } catch (\Throwable $e) {
+            } catch (\Throwable) {
                 if (!$event->isHandled()) {
-                    $event->reject($e->getMessage());
+                    $event->reject(self::SERVER_ERROR);
                 }
             }
         });
@@ -578,6 +712,10 @@ final class ServerConnection
         });
 
         $this->protocol->on(StoreEvent::class, function (StoreEvent $event): void {
+            if ($this->refusedReadOnly($event)) {
+                return;
+            }
+
             $this->dispatchWithResults('STORE', $event, function (mixed $result) use ($event): void {
                 if (!is_array($result)) {
                     return;
@@ -600,7 +738,7 @@ final class ServerConnection
                         }
                         $flags = [];
                         foreach ($entry['flags'] as $flag) {
-                            if (is_string($flag) || $flag instanceof Flag) {
+                            if ($flag instanceof Flag || (is_string($flag) && Flag::isValid($flag))) {
                                 $flags[] = (string) $flag;
                             }
                         }
@@ -620,6 +758,10 @@ final class ServerConnection
 
         $this->protocol->on(CopyEvent::class, fn(CopyEvent $e) => $this->dispatch('COPY', $e));
         $this->protocol->on(MoveEvent::class, function (MoveEvent $event): void {
+            if ($this->refusedReadOnly($event)) {
+                return;
+            }
+
             $this->dispatchWithResults('MOVE', $event, function (mixed $result): void {
 
                 if (is_array($result) && isset($result['expunged'])) {
@@ -640,6 +782,7 @@ final class ServerConnection
         });
 
         $this->protocol->on(ListEvent::class, function (ListEvent $event): void {
+            $this->rb->setUtf7Mailboxes($this->context->session()->useUtf7Mailbox());
             $handlerName = $event->isLsub() ? 'LSUB' : 'LIST';
             $handler = $this->handler->getHandler($handlerName) ?? $this->handler->getHandler('LIST');
             if ($handler === null) {
@@ -661,14 +804,15 @@ final class ServerConnection
                         }
                     }
                 }
-            } catch (\Throwable $e) {
+            } catch (\Throwable) {
                 if (!$event->isHandled()) {
-                    $event->reject($e->getMessage());
+                    $event->reject(self::SERVER_ERROR);
                 }
             }
         });
 
         $this->protocol->on(StatusEvent::class, function (StatusEvent $event): void {
+            $this->rb->setUtf7Mailboxes($this->context->session()->useUtf7Mailbox());
             $this->dispatchWithResults('STATUS', $event, function (mixed $result): void {
                 if ($result instanceof StatusInfo) {
                     $this->pendingData[] = $this->rb->status($result);
@@ -689,6 +833,10 @@ final class ServerConnection
         });
 
         $this->protocol->on(UidExpungeEvent::class, function (UidExpungeEvent $event): void {
+            if ($this->refusedReadOnly($event)) {
+                return;
+            }
+
             $this->dispatchWithResults('UID EXPUNGE', $event, function (mixed $result): void {
                 $this->reportExpunged($result);
             });
@@ -706,9 +854,9 @@ final class ServerConnection
                 if ($event->isAccepted()) {
                     $this->context->session()->enableCompression();
                 }
-            } catch (\Throwable $e) {
+            } catch (\Throwable) {
                 if (!$event->isHandled()) {
-                    $event->reject($e->getMessage());
+                    $event->reject(self::SERVER_ERROR);
                 }
             }
         });
@@ -728,18 +876,23 @@ final class ServerConnection
                     $result = $event->getResult();
                     if (is_string($result)) {
                         $name = $event->command->name;
+                        $mailbox = $this->compiler->compileString($this->context->session()->encodeMailbox($event->mailbox()));
+                        $rights = implode(' ', array_map(
+                            $this->compiler->compileString(...),
+                            array_values(array_filter(explode(' ', $result), static fn(string $right): bool => $right !== '')),
+                        ));
                         if ($name === 'GETACL') {
-                            $this->pendingData[] = '* ACL ' . $event->mailbox() . ' ' . $result . "\r\n";
+                            $this->pendingData[] = '* ACL ' . $mailbox . ' ' . $rights . "\r\n";
                         } elseif ($name === 'MYRIGHTS') {
-                            $this->pendingData[] = '* MYRIGHTS ' . $event->mailbox() . ' ' . $result . "\r\n";
+                            $this->pendingData[] = '* MYRIGHTS ' . $mailbox . ' ' . $rights . "\r\n";
                         } elseif ($name === 'LISTRIGHTS') {
-                            $this->pendingData[] = '* LISTRIGHTS ' . $event->mailbox() . ' ' . ($event->identifier() ?? '') . ' ' . $result . "\r\n";
+                            $this->pendingData[] = '* LISTRIGHTS ' . $mailbox . ' ' . $this->compiler->compileString($event->identifier() ?? '') . ' ' . $rights . "\r\n";
                         }
                     }
                 }
-            } catch (\Throwable $e) {
+            } catch (\Throwable) {
                 if (!$event->isHandled()) {
-                    $event->reject($e->getMessage());
+                    $event->reject(self::SERVER_ERROR);
                 }
             }
         });
@@ -759,14 +912,14 @@ final class ServerConnection
                         $items = [];
                         /** @var array<string, string> $result */
                         foreach ($result as $entry => $value) {
-                            $items[] = '"' . $entry . '" "' . $value . '"';
+                            $items[] = WireFormat::quoted($entry) . ' ' . WireFormat::quoted($value);
                         }
-                        $this->pendingData[] = '* METADATA ' . $event->mailbox() . ' (' . implode(' ', $items) . ")\r\n";
+                        $this->pendingData[] = '* METADATA ' . $this->compiler->compileString($this->context->session()->encodeMailbox($event->mailbox())) . ' (' . implode(' ', $items) . ")\r\n";
                     }
                 }
-            } catch (\Throwable $e) {
+            } catch (\Throwable) {
                 if (!$event->isHandled()) {
-                    $event->reject($e->getMessage());
+                    $event->reject(self::SERVER_ERROR);
                 }
             }
         });
@@ -775,6 +928,10 @@ final class ServerConnection
             $name = strtoupper($event->command->name);
 
             if ($name === 'EXPUNGE') {
+                if ($this->refusedReadOnly($event)) {
+                    return;
+                }
+
                 $this->dispatchWithResults('EXPUNGE', $event, function (mixed $result): void {
                     $this->reportExpunged($result);
                 });
@@ -786,8 +943,8 @@ final class ServerConnection
                 if ($handler !== null) {
                     try {
                         $handler($event, $this->context);
-                    } catch (\Throwable $e) {
-                        $event->reject($e->getMessage());
+                    } catch (\Throwable) {
+                        $event->reject(self::SERVER_ERROR);
                         return;
                     }
                 }
@@ -810,6 +967,10 @@ final class ServerConnection
                     $this->dispatch('CAPABILITY', $event);
                     return;
                 }
+                $capabilities = $this->context->session()->capabilities();
+                if (count($capabilities) > 0) {
+                    $this->pendingData[] = $this->rb->capability($capabilities);
+                }
                 $event->accept();
                 return;
             }
@@ -827,9 +988,9 @@ final class ServerConnection
             if ($handler !== null) {
                 try {
                     $handler($event, $this->context);
-                } catch (\Throwable $e) {
+                } catch (\Throwable) {
                     if (!$event->isHandled()) {
-                        $event->reject($e->getMessage());
+                        $event->reject(self::SERVER_ERROR);
                     }
                     return;
                 }
@@ -853,9 +1014,9 @@ final class ServerConnection
             if ($event->isAccepted() && $onAccept !== null) {
                 $onAccept();
             }
-        } catch (\Throwable $e) {
+        } catch (\Throwable) {
             if (!$event->isHandled()) {
-                $event->reject($e->getMessage());
+                $event->reject(self::SERVER_ERROR);
             }
         }
     }
@@ -864,7 +1025,11 @@ final class ServerConnection
     {
         $handler = $this->handler->getHandler($name);
         if ($handler === null) {
-            $event->accept();
+            if (in_array($name, ['ID', 'NAMESPACE'], true)) {
+                $event->accept();
+            } else {
+                $event->reject($name . ' not available');
+            }
             return;
         }
 
@@ -873,9 +1038,9 @@ final class ServerConnection
             if ($event->isAccepted()) {
                 $processResults($event->getResult());
             }
-        } catch (\Throwable $e) {
+        } catch (\Throwable) {
             if (!$event->isHandled()) {
-                $event->reject($e->getMessage());
+                $event->reject(self::SERVER_ERROR);
             }
         }
     }

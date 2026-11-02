@@ -28,6 +28,7 @@ final class ConnectionContext
     /** @var list<int> */
     private array $uidList = [];
     private bool $tracksUids = false;
+    private bool $ascending = true;
     private int $modseq = 0;
     /** @var array<string, mixed> */
     private array $data = [];
@@ -135,6 +136,42 @@ final class ConnectionContext
     {
         $this->tracksUids = $uids !== null;
         $this->uidList = $uids ?? [];
+        $this->ascending = true;
+        for ($i = 1, $count = count($this->uidList); $i < $count; $i++) {
+            if ($this->uidList[$i] <= $this->uidList[$i - 1]) {
+                $this->ascending = false;
+                break;
+            }
+        }
+    }
+
+    /**
+     * Where a UID sits in the sequence map: a binary search, as UIDs ascend with sequence numbers.
+     */
+    private function indexOf(int $uid): int|null
+    {
+        if (!$this->ascending) {
+            $index = array_search($uid, $this->uidList, true);
+
+            return $index === false ? null : $index;
+        }
+
+        $low = 0;
+        $high = count($this->uidList) - 1;
+        while ($low <= $high) {
+            $middle = intdiv($low + $high, 2);
+            $found = $this->uidList[$middle];
+            if ($found === $uid) {
+                return $middle;
+            }
+            if ($found < $uid) {
+                $low = $middle + 1;
+            } else {
+                $high = $middle - 1;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -151,7 +188,9 @@ final class ConnectionContext
      */
     public function appendUid(int $uid): int
     {
-        if (!in_array($uid, $this->uidList, true)) {
+        if ($this->indexOf($uid) === null) {
+            $last = $this->uidList[count($this->uidList) - 1] ?? 0;
+            $this->ascending = $this->ascending && $uid > $last;
             $this->uidList[] = $uid;
         }
 
@@ -164,8 +203,8 @@ final class ConnectionContext
      */
     public function removeUid(int $uid): int|null
     {
-        $index = array_search($uid, $this->uidList, true);
-        if ($index === false) {
+        $index = $this->indexOf($uid);
+        if ($index === null) {
             return null;
         }
 
@@ -181,8 +220,9 @@ final class ConnectionContext
 
     public function uidToSequence(int $uid): int|null
     {
-        $index = array_search($uid, $this->uidList, true);
-        return $index !== false ? $index + 1 : null;
+        $index = $this->indexOf($uid);
+
+        return $index !== null ? $index + 1 : null;
     }
 
     public function setModseq(int $modseq): void

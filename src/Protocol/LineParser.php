@@ -70,6 +70,14 @@ final class LineParser
     }
 
     /**
+     * Sets how many literal bytes one command may carry from the next line on, 0 for no limit.
+     */
+    public function setMaxLiteralSize(int $bytes): void
+    {
+        $this->maxLiteralSize = $bytes;
+    }
+
+    /**
      * Feed raw bytes and yield complete lines.
      *
      * @return list<string>
@@ -139,7 +147,7 @@ final class LineParser
                 $this->startDiscarding('Command line too long');
             }
 
-            if (preg_match('/\{(\d+)(\+)?\}\s*$/', $line, $matches) === 1) {
+            if (preg_match('/\{(\d+)(\+)?\}$/', $line, $matches) === 1) {
                 $litSize = (int) $matches[1];
                 $this->literalPlus = isset($matches[2]);
 

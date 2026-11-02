@@ -136,6 +136,17 @@ $swoole->on('receive', function ($srv, $fd, $r, $data) use (&$connections) {
 // Workerman, ReactPHP, Amp — same pattern
 ```
 
+A connection runs one command at a time: bytes that arrive while a handler is
+waiting (a coroutine yielding on a database query) are held and answered, in
+order, by the call already running — the second `onData()` returns nothing.
+
+On a plaintext listener that offers STARTTLS, call
+`$conn->context()->session()->setTlsActive(false)` before the greeting. LOGIN
+is then refused until the client upgrades; once `$conn->needsTlsUpgrade()` is
+true after an OK, flush that OK, run the TLS handshake on the socket, and call
+`$conn->tlsUpgraded()`. Nothing the client sent after STARTTLS and before the
+handshake is ever run as a command.
+
 ### Several sessions on one mailbox
 
 Sequence numbers are per session. Hand the mailbox's UIDs to `SelectResult`
@@ -219,9 +230,14 @@ A custom transport gets the same through `ServerConnection::onDataDeferred()`
 
 - Commands per connection: token bucket, `maxCommandsPerSecond` (50) refill
   with a `commandBurst` (500) allowance; exceeding it ends the session with BYE.
-- `maxConnections` (512); non-IDLE connections time out after
-  `connectionTimeout`, IDLE ones after `idleTimeout` (35 min — RFC 2177
-  clients re-issue IDLE within 29).
+- `maxConnections` (512), at most `maxConnectionsPerAddress` (32) from one
+  address; a connection that has not logged in times out after
+  `preAuthTimeout` (60 s), other non-IDLE ones after `connectionTimeout`,
+  IDLE ones after `idleTimeout` (35 min — RFC 2177 clients re-issue IDLE
+  within 29).
+- `enableTls()` offers STARTTLS: sessions start with LOGIN disabled and are
+  upgraded in place; `enableImplicitTls()` serves IMAPS.
+- Before login, one command may carry at most 8 KB of literals.
 - Command lines over 64 KB and literals over `maxLiteralBytes` (50 MB) are
   refused with a tagged BAD — a synchronizing literal before its data is
   sent; literal data does not count against the line limit.

@@ -26,6 +26,7 @@ use PHPdot\Mail\IMAP\DataType\ValueObject\NamespaceSet;
 use PHPdot\Mail\IMAP\DataType\ValueObject\Tag;
 use PHPdot\Mail\IMAP\Exception\AuthenticationException;
 use PHPdot\Mail\IMAP\Exception\ConnectionException;
+use PHPdot\Mail\IMAP\Exception\InvalidArgumentException;
 use PHPdot\Mail\IMAP\Exception\RuntimeException;
 use PHPdot\Mail\IMAP\Protocol\Session;
 use PHPdot\Mail\IMAP\Result\IdleNotification;
@@ -117,7 +118,7 @@ final class ImapClient
     public function login(string $user, string $pass): void
     {
         [$tag, $bytes] = $this->protocol->command()->login($user, $pass);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $tagged = $this->readUntilTagged($tag);
         if (!$tagged->isOk()) {
             throw new AuthenticationException('Login failed: ' . $tagged->responseText->text);
@@ -127,9 +128,12 @@ final class ImapClient
     public function authenticate(string $mechanism, string $token): void
     {
         [$tag, $bytes] = $this->protocol->command()->authenticate($mechanism, $token);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $tagged = $this->readUntilTaggedOrContinuation($tag);
         if ($tagged === null) {
+            if (strpbrk($token, "\r\n\0") !== false) {
+                throw new InvalidArgumentException('A SASL response cannot contain line breaks');
+            }
             $this->write($token . "\r\n");
             $tagged = $this->readUntilTagged($tag);
         }
@@ -141,11 +145,12 @@ final class ImapClient
     public function startTls(): void
     {
         [$tag, $bytes] = $this->protocol->command()->startTls();
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $tagged = $this->readUntilTagged($tag);
         if (!$tagged->isOk()) {
             throw new RuntimeException('STARTTLS failed: ' . $tagged->responseText->text);
         }
+        $this->protocol->discardPending();
         $this->upgradeToTls();
         $this->protocol->session()->setTlsActive();
         $this->protocol->session()->invalidateCapabilities();
@@ -155,7 +160,7 @@ final class ImapClient
     {
         if ($this->protocol->session()->capabilities()->count() === 0) {
             [$tag, $bytes] = $this->protocol->command()->capability();
-            $this->write($bytes);
+            $this->sendCommand($tag, $bytes);
             $this->readUntilTagged($tag);
         }
         return $this->protocol->session()->capabilities();
@@ -180,7 +185,7 @@ final class ImapClient
     {
         $this->protocol->resetSelectState();
         [$tag, $bytes] = $this->protocol->command()->selectQresync($mailbox, $uidValidity, $modseq, $knownUids);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $tagged = $this->readUntilTagged($tag);
         if (!$tagged->isOk()) {
             throw new RuntimeException('SELECT QRESYNC failed: ' . $tagged->responseText->text);
@@ -221,7 +226,7 @@ final class ImapClient
     public function listMailboxes(string $reference = '', string $pattern = '*'): array
     {
         [$tag, $bytes] = $this->protocol->command()->list($reference, $pattern);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         $result = [];
         foreach ($this->protocol->drainUnsolicitedByType('LIST') as $response) {
@@ -234,7 +239,7 @@ final class ImapClient
     public function lsub(string $reference = '', string $pattern = '*'): array
     {
         [$tag, $bytes] = $this->protocol->command()->lsub($reference, $pattern);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         $result = [];
         foreach ($this->protocol->drainUnsolicitedByType('LSUB') as $response) {
@@ -254,7 +259,7 @@ final class ImapClient
     public function listExtended(string $reference = '', string $pattern = '*', array $selectOptions = [], array $returnOptions = []): array
     {
         [$tag, $bytes] = $this->protocol->command()->listExtended($reference, $pattern, $selectOptions, $returnOptions);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         $result = [];
         foreach ($this->protocol->drainUnsolicitedByType('LIST') as $response) {
@@ -273,7 +278,7 @@ final class ImapClient
     public function listStatus(string $reference = '', string $pattern = '*', array $statusItems = ['MESSAGES', 'UNSEEN']): array
     {
         [$tag, $bytes] = $this->protocol->command()->listStatus($reference, $pattern, $statusItems);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         $result = [];
         foreach ($this->protocol->drainUnsolicitedByType('LIST') as $response) {
@@ -286,7 +291,7 @@ final class ImapClient
     public function status(string $mailbox, array $items = ['MESSAGES', 'UNSEEN', 'UIDNEXT', 'UIDVALIDITY']): StatusInfo
     {
         [$tag, $bytes] = $this->protocol->command()->status($mailbox, $items);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         foreach ($this->protocol->drainUnsolicitedByType('STATUS') as $response) {
             return $this->protocol->interpreter()->interpretStatus($response);
@@ -302,7 +307,7 @@ final class ImapClient
     public function fetch(string $sequence, array $items = ['FLAGS', 'ENVELOPE', 'RFC822.SIZE']): array
     {
         [$tag, $bytes] = $this->protocol->command()->fetch($sequence, '(' . implode(' ', $items) . ')');
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         return $this->protocol->drainFetchResults();
     }
@@ -315,7 +320,7 @@ final class ImapClient
     public function uidFetch(string $sequence, array $items = ['FLAGS', 'ENVELOPE', 'RFC822.SIZE']): array
     {
         [$tag, $bytes] = $this->protocol->command()->uidFetch($sequence, '(' . implode(' ', $items) . ')');
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         return $this->protocol->drainFetchResults();
     }
@@ -341,7 +346,7 @@ final class ImapClient
     public function fetchBinary(string $sequence, string $section): string|null
     {
         [$tag, $bytes] = $this->protocol->command()->fetch($sequence, '(BINARY[' . $section . '])');
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         $results = $this->protocol->drainFetchResults();
         return $this->extractBinaryContent($results);
@@ -350,7 +355,7 @@ final class ImapClient
     public function uidFetchBinary(string $uid, string $section): string|null
     {
         [$tag, $bytes] = $this->protocol->command()->uidFetch($uid, '(BINARY[' . $section . '])');
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         $results = $this->protocol->drainFetchResults();
         return $this->extractBinaryContent($results);
@@ -360,7 +365,7 @@ final class ImapClient
     public function search(string $criteria): array
     {
         [$tag, $bytes] = $this->protocol->command()->search($criteria);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         foreach ($this->protocol->drainUnsolicitedByType('SEARCH') as $response) {
             return $this->protocol->interpreter()->interpretSearch($response);
@@ -372,7 +377,7 @@ final class ImapClient
     public function uidSearch(string $criteria): array
     {
         [$tag, $bytes] = $this->protocol->command()->uidSearch($criteria);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         foreach ($this->protocol->drainUnsolicitedByType('SEARCH') as $response) {
             return $this->protocol->interpreter()->interpretSearch($response);
@@ -390,7 +395,7 @@ final class ImapClient
     public function sort(string $criteria, string $searchCriteria = 'ALL', string $charset = 'UTF-8'): array
     {
         [$tag, $bytes] = $this->protocol->command()->sort($criteria, $charset, $searchCriteria);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         foreach ($this->protocol->drainUnsolicitedByType('SORT') as $response) {
             return $this->protocol->interpreter()->interpretSearch($response);
@@ -402,7 +407,7 @@ final class ImapClient
     public function uidSort(string $criteria, string $searchCriteria = 'ALL', string $charset = 'UTF-8'): array
     {
         [$tag, $bytes] = $this->protocol->command()->uidSort($criteria, $charset, $searchCriteria);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         foreach ($this->protocol->drainUnsolicitedByType('SORT') as $response) {
             return $this->protocol->interpreter()->interpretSearch($response);
@@ -420,7 +425,7 @@ final class ImapClient
     public function thread(string $algorithm = 'REFERENCES', string $searchCriteria = 'ALL', string $charset = 'UTF-8'): array
     {
         [$tag, $bytes] = $this->protocol->command()->thread($algorithm, $charset, $searchCriteria);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         $threads = [];
         foreach ($this->protocol->drainUnsolicitedByType('THREAD') as $response) {
@@ -435,7 +440,7 @@ final class ImapClient
     public function uidThread(string $algorithm = 'REFERENCES', string $searchCriteria = 'ALL', string $charset = 'UTF-8'): array
     {
         [$tag, $bytes] = $this->protocol->command()->uidThread($algorithm, $charset, $searchCriteria);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         $threads = [];
         foreach ($this->protocol->drainUnsolicitedByType('THREAD') as $response) {
@@ -479,7 +484,7 @@ final class ImapClient
     public function expunge(): array
     {
         [$tag, $bytes] = $this->protocol->command()->expunge();
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         return $this->protocol->drainExpunges();
     }
@@ -488,7 +493,7 @@ final class ImapClient
     public function uidExpunge(string $uidSet): array
     {
         [$tag, $bytes] = $this->protocol->command()->uidExpunge($uidSet);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         return $this->protocol->drainExpunges();
     }
@@ -503,14 +508,7 @@ final class ImapClient
         $flagObjs = array_map(static fn(string $f): Flag => new Flag($f), $flags);
         [$tag, $bytes] = $this->protocol->command()->append($mailbox, $message, $flagObjs, $date);
 
-        $literalPos = strpos($bytes, "}\r\n");
-        if ($literalPos !== false) {
-            $this->write(substr($bytes, 0, $literalPos + 3));
-            $this->readUntilContinuation();
-            $this->write(substr($bytes, $literalPos + 3));
-        } else {
-            $this->write($bytes);
-        }
+        $this->sendCommand($tag, $bytes);
 
         $tagged = $this->readUntilTagged($tag);
         if (!$tagged->isOk()) {
@@ -533,7 +531,7 @@ final class ImapClient
     {
         while (true) {
             [$tag, $bytes] = $this->protocol->command()->idle();
-            $this->write($bytes);
+            $this->sendCommand($tag, $bytes);
             $this->readUntilContinuation();
 
             $idleStart = time();
@@ -564,7 +562,7 @@ final class ImapClient
     public function getAcl(string $mailbox): string
     {
         [$tag, $bytes] = $this->protocol->command()->getAcl($mailbox);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         foreach ($this->protocol->drainUnsolicitedByType('ACL') as $response) {
             $parts = [];
@@ -589,7 +587,7 @@ final class ImapClient
     public function myRights(string $mailbox): string
     {
         [$tag, $bytes] = $this->protocol->command()->myRights($mailbox);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         foreach ($this->protocol->drainUnsolicitedByType('MYRIGHTS') as $response) {
             $parts = [];
@@ -604,7 +602,7 @@ final class ImapClient
     public function listRights(string $mailbox, string $identifier): string
     {
         [$tag, $bytes] = $this->protocol->command()->listRights($mailbox, $identifier);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         foreach ($this->protocol->drainUnsolicitedByType('LISTRIGHTS') as $response) {
             $parts = [];
@@ -624,7 +622,7 @@ final class ImapClient
     public function getMetadata(string $mailbox, array $entries): array
     {
         [$tag, $bytes] = $this->protocol->command()->getMetadata($mailbox, $entries);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         $result = [];
         foreach ($this->protocol->drainUnsolicitedByType('METADATA') as $response) {
@@ -647,7 +645,7 @@ final class ImapClient
     public function getQuota(string $root): array
     {
         [$tag, $bytes] = $this->protocol->command()->getQuota($root);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         $result = [];
         foreach ($this->protocol->drainUnsolicitedByType('QUOTA') as $response) {
@@ -673,7 +671,7 @@ final class ImapClient
     public function getQuotaRoot(string $mailbox): array
     {
         [$tag, $bytes] = $this->protocol->command()->getQuotaRoot($mailbox);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         /** @var array{mailbox?: string, roots?: list<string>, quotas?: array<string, array<string, array{usage: int, limit: int}>>} $result */
         $result = [];
@@ -714,7 +712,7 @@ final class ImapClient
     public function namespace(): NamespaceSet
     {
         [$tag, $bytes] = $this->protocol->command()->namespace();
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         foreach ($this->protocol->drainUnsolicitedByType('NAMESPACE') as $response) {
             return $this->protocol->interpreter()->interpretNamespace($response);
@@ -730,7 +728,7 @@ final class ImapClient
     public function enable(array $capabilities): array
     {
         [$tag, $bytes] = $this->protocol->command()->enable($capabilities);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $this->readUntilTagged($tag);
         $enabled = [];
         foreach ($this->protocol->drainUnsolicitedByType('ENABLED') as $response) {
@@ -755,7 +753,7 @@ final class ImapClient
     public function logout(): void
     {
         [$tag, $bytes] = $this->protocol->command()->logout();
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         try {
             $this->readUntilTagged($tag);
         } catch (ConnectionException) {
@@ -811,6 +809,45 @@ final class ImapClient
             return '';
         }
         return $data;
+    }
+
+    /**
+     * Sends one command, waiting for the server's continuation before each synchronizing literal; a line break
+     * anywhere but a literal's own framing is refused, so no argument can smuggle a second command.
+     */
+    private function sendCommand(Tag $tag, string $bytes): void
+    {
+        $sent = 0;
+        $scan = 0;
+        $length = strlen($bytes);
+
+        while (($end = strpos($bytes, "\r\n", $scan)) !== false) {
+            $line = substr($bytes, $scan, $end - $scan);
+            if (strpbrk($line, "\r\n\0") !== false) {
+                throw new InvalidArgumentException('An IMAP command argument cannot contain line breaks');
+            }
+
+            if ($end + 2 === $length) {
+                $this->write(substr($bytes, $sent));
+
+                return;
+            }
+
+            if (preg_match('/\{(\d+)(\+)?\}$/', $line, $literal) !== 1) {
+                throw new InvalidArgumentException('An IMAP command argument cannot contain line breaks');
+            }
+
+            $scan = $end + 2 + (int) $literal[1];
+            if (!isset($literal[2])) {
+                $this->write(substr($bytes, $sent, $end + 2 - $sent));
+                $sent = $end + 2;
+                if ($this->readUntilTaggedOrContinuation($tag) !== null) {
+                    throw new RuntimeException('The server refused the command before its literal was sent');
+                }
+            }
+        }
+
+        throw new InvalidArgumentException('An IMAP command must end with CRLF');
     }
 
     private function write(string $data): void
@@ -902,7 +939,7 @@ final class ImapClient
         [$tag, $bytes] = $readOnly
             ? $this->protocol->command()->examine($mailbox)
             : $this->protocol->command()->select($mailbox);
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $tagged = $this->readUntilTagged($tag);
         if (!$tagged->isOk()) {
             throw new RuntimeException(($readOnly ? 'EXAMINE' : 'SELECT') . ' failed: ' . $tagged->responseText->text);
@@ -931,7 +968,7 @@ final class ImapClient
     private function doFetchStream(array $command, callable $callback): void
     {
         [$tag, $bytes] = $command;
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         while (true) {
             $data = $this->read();
             if ($data === '') {
@@ -955,7 +992,7 @@ final class ImapClient
     private function executeSimple(array $command, string $name): void
     {
         [$tag, $bytes] = $command;
-        $this->write($bytes);
+        $this->sendCommand($tag, $bytes);
         $tagged = $this->readUntilTagged($tag);
         if (!$tagged->isOk()) {
             throw new RuntimeException($name . ' failed: ' . $tagged->responseText->text);

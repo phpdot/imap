@@ -13,6 +13,7 @@ namespace PHPdot\Mail\IMAP\DataType\ValueObject;
 
 use PHPdot\Mail\IMAP\DataType\Enum\SystemFlag;
 use PHPdot\Mail\IMAP\Exception\InvalidArgumentException;
+use PHPdot\Mail\IMAP\Protocol\Charset\CharacterSet;
 
 readonly class Flag implements \Stringable
 {
@@ -25,6 +26,10 @@ readonly class Flag implements \Stringable
             throw new InvalidArgumentException('Flag must not be empty');
         }
 
+        if (!self::isValid($value)) {
+            throw new InvalidArgumentException('Flag is not a valid IMAP flag');
+        }
+
         $this->systemFlag = SystemFlag::tryFromCaseInsensitive($value);
 
         if ($this->systemFlag !== null) {
@@ -32,6 +37,20 @@ readonly class Flag implements \Stringable
         } else {
             $this->value = $value;
         }
+    }
+
+    /**
+     * Whether a value is a flag the grammar allows: an atom, a backslash and an atom, or the \* wildcard.
+     */
+    public static function isValid(string $value): bool
+    {
+        if ($value === '\\*') {
+            return true;
+        }
+
+        $atom = str_starts_with($value, '\\') ? substr($value, 1) : $value;
+
+        return $atom !== '' && CharacterSet::isValidAtom($atom);
     }
 
     public function isSystem(): bool

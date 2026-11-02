@@ -21,8 +21,10 @@ use PHPdot\Mail\IMAP\DataType\ValueObject\Flag;
 use PHPdot\Mail\IMAP\DataType\ValueObject\Mailbox;
 use PHPdot\Mail\IMAP\DataType\ValueObject\SequenceSet;
 use PHPdot\Mail\IMAP\DataType\ValueObject\Tag;
+use PHPdot\Mail\IMAP\Exception\EncodingException;
 use PHPdot\Mail\IMAP\Exception\ParseErrorCode;
 use PHPdot\Mail\IMAP\Exception\ParseException;
+use PHPdot\Mail\IMAP\Protocol\Encoding\ModifiedUtf7;
 use PHPdot\Mail\IMAP\Protocol\Search\SearchQueryParser;
 use PHPdot\Mail\IMAP\Protocol\Tokenizer;
 use PHPdot\Mail\IMAP\Server\Command\AclCommand;
@@ -54,11 +56,41 @@ final class CommandParser
 {
     private readonly Tokenizer $tokenizer;
     private readonly SearchQueryParser $searchParser;
+    private bool $utf7Mailboxes = false;
 
     public function __construct()
     {
         $this->tokenizer = new Tokenizer();
         $this->searchParser = new SearchQueryParser();
+    }
+
+    /**
+     * Sets whether mailbox names arrive in modified UTF-7, as an IMAP4rev1 client without UTF8=ACCEPT sends them.
+     */
+    public function setUtf7Mailboxes(bool $utf7): void
+    {
+        $this->utf7Mailboxes = $utf7;
+    }
+
+    /**
+     * A mailbox name as UTF-8, whichever form the client sent it in.
+     */
+    private function name(string $wire): string
+    {
+        if (!$this->utf7Mailboxes) {
+            return $wire;
+        }
+
+        try {
+            return ModifiedUtf7::decode($wire);
+        } catch (EncodingException $e) {
+            throw new ParseException($e->getMessage(), ParseErrorCode::InvalidCommand);
+        }
+    }
+
+    private function mailbox(string $wire): Mailbox
+    {
+        return new Mailbox($this->name($wire));
     }
 
     public function parse(string $line): Command
@@ -75,6 +107,9 @@ final class CommandParser
         }
 
         $tag = new Tag($tokens[0]->stringValue());
+        if ($tag->value === '*' || $tag->value === '+') {
+            throw new ParseException('A command tag cannot be ' . $tag->value, ParseErrorCode::InvalidCommand);
+        }
         $commandName = strtoupper($tokens[1]->stringValue());
         $args = array_slice($tokens, 2);
 
@@ -116,31 +151,31 @@ final class CommandParser
             'GETACL', 'MYRIGHTS' => new AclCommand(
                 $tag,
                 $commandName,
-                isset($args[0]) ? $args[0]->stringValue() : '',
+                isset($args[0]) ? $this->name($args[0]->stringValue()) : '',
             ),
             'SETACL' => new AclCommand(
                 $tag,
                 'SETACL',
-                isset($args[0]) ? $args[0]->stringValue() : '',
+                isset($args[0]) ? $this->name($args[0]->stringValue()) : '',
                 isset($args[1]) ? $args[1]->stringValue() : null,
                 isset($args[2]) ? $args[2]->stringValue() : null,
             ),
             'DELETEACL' => new AclCommand(
                 $tag,
                 'DELETEACL',
-                isset($args[0]) ? $args[0]->stringValue() : '',
+                isset($args[0]) ? $this->name($args[0]->stringValue()) : '',
                 isset($args[1]) ? $args[1]->stringValue() : null,
             ),
             'LISTRIGHTS' => new AclCommand(
                 $tag,
                 'LISTRIGHTS',
-                isset($args[0]) ? $args[0]->stringValue() : '',
+                isset($args[0]) ? $this->name($args[0]->stringValue()) : '',
                 isset($args[1]) ? $args[1]->stringValue() : null,
             ),
             'GETMETADATA' => new MetadataCommand(
                 $tag,
                 'GETMETADATA',
-                isset($args[0]) ? $args[0]->stringValue() : '',
+                isset($args[0]) ? $this->name($args[0]->stringValue()) : '',
                 array_map(fn(Token $t): string => $t->stringValue(), array_slice($args, 1)),
             ),
             'SETMETADATA' => $this->parseSetMetadata($tag, $args),
@@ -188,7 +223,7 @@ final class CommandParser
                 }
             }
         }
-        return new SelectCommand($tag, new Mailbox($args[0]->stringValue()), $readOnly, $condstore);
+        return new SelectCommand($tag, $this->mailbox($args[0]->stringValue()), $readOnly, $condstore);
     }
 
     /**
@@ -199,7 +234,7 @@ final class CommandParser
         if ($args === []) {
             throw new ParseException($name . ' requires mailbox', ParseErrorCode::InvalidCommand);
         }
-        return new MailboxCommand($tag, $name, new Mailbox($args[0]->stringValue()));
+        return new MailboxCommand($tag, $name, $this->mailbox($args[0]->stringValue()));
     }
 
     /**
@@ -210,7 +245,7 @@ final class CommandParser
         if (count($args) < 2) {
             throw new ParseException('RENAME requires from and to mailbox', ParseErrorCode::InvalidCommand);
         }
-        return new RenameCommand($tag, new Mailbox($args[0]->stringValue()), new Mailbox($args[1]->stringValue()));
+        return new RenameCommand($tag, $this->mailbox($args[0]->stringValue()), $this->mailbox($args[1]->stringValue()));
     }
 
     /**
@@ -229,9 +264,9 @@ final class CommandParser
             $pos++;
         }
 
-        $reference = isset($args[$pos]) ? $args[$pos]->stringValue() : '';
+        $reference = isset($args[$pos]) ? $this->name($args[$pos]->stringValue()) : '';
         $pos++;
-        $pattern = isset($args[$pos]) ? $args[$pos]->stringValue() : '*';
+        $pattern = isset($args[$pos]) ? $this->name($args[$pos]->stringValue()) : '*';
         $pos++;
 
         if (isset($args[$pos]) && strtoupper($args[$pos]->stringValue()) === 'RETURN' && isset($args[$pos + 1])) {
@@ -255,7 +290,7 @@ final class CommandParser
             throw new ParseException('STATUS requires mailbox and attributes', ParseErrorCode::InvalidCommand);
         }
 
-        $mailbox = new Mailbox($args[0]->stringValue());
+        $mailbox = $this->mailbox($args[0]->stringValue());
         $attrs = [];
 
         $attrTokens = $args[1]->isList() ? $args[1]->children : [$args[1]];
@@ -278,7 +313,7 @@ final class CommandParser
             throw new ParseException('APPEND requires mailbox', ParseErrorCode::InvalidCommand);
         }
 
-        $mailbox = new Mailbox($args[0]->stringValue());
+        $mailbox = $this->mailbox($args[0]->stringValue());
         $flags = [];
         $date = null;
         $message = '';
@@ -395,7 +430,8 @@ final class CommandParser
         }
 
         $actionStr = strtoupper($args[$actionPos]->stringValue());
-        $operation = StoreOperation::from($actionStr);
+        $operation = StoreOperation::tryFrom($actionStr)
+            ?? throw new ParseException('Unknown STORE action ' . $actionStr, ParseErrorCode::InvalidCommand);
 
         $flagTokens = isset($args[$actionPos + 1]) && $args[$actionPos + 1]->isList()
             ? $args[$actionPos + 1]->children
@@ -421,7 +457,7 @@ final class CommandParser
             $tag,
             $name,
             SequenceSet::fromString($args[0]->stringValue()),
-            new Mailbox($args[1]->stringValue()),
+            $this->mailbox($args[1]->stringValue()),
             $isUid,
         );
     }
@@ -453,7 +489,7 @@ final class CommandParser
      */
     private function parseSetMetadata(Tag $tag, array $args): MetadataCommand
     {
-        $mailbox = isset($args[0]) ? $args[0]->stringValue() : '';
+        $mailbox = isset($args[0]) ? $this->name($args[0]->stringValue()) : '';
         $values = [];
 
         if (isset($args[1]) && $args[1]->isList()) {

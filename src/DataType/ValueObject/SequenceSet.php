@@ -95,15 +95,24 @@ readonly class SequenceSet implements \Stringable
      */
     public function expand(int $max): array
     {
-        $result = [];
+        $bounds = [];
         foreach ($this->ranges as $range) {
-            foreach ($range->expand($max) as $num) {
-                $result[] = $num;
+            $covered = $range->bounds($max);
+            if ($covered !== null) {
+                $bounds[] = $covered;
             }
         }
+        sort($bounds);
 
-        $result = array_values(array_unique($result));
-        sort($result);
+        $result = [];
+        $next = 1;
+        foreach ($bounds as [$low, $high]) {
+            for ($i = max($low, $next); $i <= $high; $i++) {
+                $result[] = $i;
+            }
+            $next = max($next, $high + 1);
+        }
+
         return $result;
     }
 

@@ -268,6 +268,19 @@ final class ClientProtocol
     }
 
     /**
+     * Forget everything read so far but not yet consumed: after STARTTLS, nothing the plaintext peer sent counts.
+     */
+    public function discardPending(): void
+    {
+        $this->lineParser->reset();
+        $this->pendingExpunges = [];
+        $this->pendingFetchResults = [];
+        $this->pendingUnsolicitedResponses = [];
+        $this->lastTaggedResponse = null;
+        $this->lastContinuation = null;
+    }
+
+    /**
      * Reset the line parser (for reconnect).
      */
     public function resetParser(): void

@@ -64,4 +64,17 @@ final class ModifiedUtf7Test extends TestCase
         self::assertSame($plain, ModifiedUtf7::encode($plain));
         self::assertSame($plain, ModifiedUtf7::decode($plain));
     }
+
+    #[Test]
+    public function decodeRefusesSpellingsEncodeWouldNotProduce(): void
+    {
+        foreach (['&AEkATgBCAE8AWA-', '&AAoADQ-', '&3AA-', '&AAA-'] as $spelling) {
+            try {
+                ModifiedUtf7::decode($spelling);
+                self::fail($spelling . ' was decoded');
+            } catch (EncodingException) {
+                self::assertTrue(true);
+            }
+        }
+    }
 }

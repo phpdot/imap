@@ -50,7 +50,9 @@ class AuthenticateEvent extends Event
 
     public function initialResponse(): string|null
     {
-        return $this->authenticateCommand->initialResponse;
+        $initial = $this->authenticateCommand->initialResponse;
+
+        return $initial === '=' ? '' : $initial;
     }
 
     /**
@@ -59,7 +61,7 @@ class AuthenticateEvent extends Event
      */
     public function response(): string|null
     {
-        return $this->clientResponse ?? $this->authenticateCommand->initialResponse;
+        return $this->clientResponse ?? $this->initialResponse();
     }
 
     /**
