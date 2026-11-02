@@ -15,7 +15,8 @@ use PHPdot\Mail\IMAP\Exception\InvalidArgumentException;
 
 readonly class SequenceSet implements \Stringable
 {
-    private const string VALIDATION_PATTERN = '/^(\d+|\*)(:\d+|:\*)?(,(\d+|\*)(:\d+|:\*)?)*$/';
+    /** One comma-separated part, checked alone so a set of any length never meets the regex engine's limits. */
+    private const string PART_PATTERN = '/^(\d+|\*)(:\d+|:\*)?$/';
 
     /**
      * @param list<SequenceRange> $ranges
@@ -33,14 +34,13 @@ readonly class SequenceSet implements \Stringable
             return new self([], true);
         }
 
-        if (preg_match(self::VALIDATION_PATTERN, $wire) !== 1) {
-            throw new InvalidArgumentException(
-                sprintf('Invalid sequence set: "%s"', $wire),
-            );
-        }
-
         $ranges = [];
         foreach (explode(',', $wire) as $part) {
+            if (preg_match(self::PART_PATTERN, $part) !== 1) {
+                throw new InvalidArgumentException(
+                    sprintf('Invalid sequence set: "%s"', $wire),
+                );
+            }
             if (str_contains($part, ':')) {
                 [$start, $end] = explode(':', $part, 2);
                 $ranges[] = new SequenceRange(
