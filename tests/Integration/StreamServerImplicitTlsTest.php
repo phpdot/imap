@@ -22,6 +22,11 @@ use RuntimeException;
 /**
  * Implicit TLS (IMAPS) behavior.
  */
+/**
+ * A boot-phase port collision on a shared runner: retryable.
+ */
+final class BootCollision extends RuntimeException {}
+
 final class StreamServerImplicitTlsTest extends TestCase
 {
     private static string $certFile = '';
@@ -96,6 +101,30 @@ final class StreamServerImplicitTlsTest extends TestCase
      */
     private function withServer(callable $client): void
     {
+        $failure = null;
+
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            try {
+                $this->bootServerOnce($client);
+
+                return;
+            } catch (BootCollision $collision) {
+                $failure = $collision;
+            }
+        }
+
+        throw $failure;
+    }
+
+    /**
+     * A randomly chosen port can collide on a busy shared runner between the
+     * pick and the child's bind; a boot collision retries on a fresh port,
+     * and every other failure surfaces untouched, assertions included.
+     *
+     * @param callable(int): void $client
+     */
+    private function bootServerOnce(callable $client): void
+    {
         $port = random_int(25000, 49999);
         $stdout = tempnam(sys_get_temp_dir(), 'imaps-out-') ?: throw new RuntimeException('temp file failed');
         $stderr = tempnam(sys_get_temp_dir(), 'imaps-err-') ?: throw new RuntimeException('temp file failed');
@@ -115,6 +144,11 @@ final class StreamServerImplicitTlsTest extends TestCase
             $client($port);
         } catch (Throwable $failure) {
             $serverLog = (string) file_get_contents($stderr);
+
+            if (str_contains($failure->getMessage(), 'never came up')) {
+                throw new BootCollision($serverLog, $failure);
+            }
+
             throw new RuntimeException(
                 $failure->getMessage() . "\n--- fixture stderr ---\n" . $serverLog,
             );
